@@ -1,8 +1,8 @@
-import { version } from '../../../package.json';
 import type { AnchorConfig } from '@/core/config.ts';
-import { ValidationError } from '@/core/errors.ts';
+import { PayloadTooLargeError, ValidationError } from '@/core/errors.ts';
 import { InMemoryRateLimiter, type RateLimitRule } from '@/runtime/http/rate-limiter.ts';
 import type { DatabaseAdapter, WebhookProcessor } from '@/runtime/interfaces.ts';
+import { IdempotencyUtils } from '@/utils/idempotency.ts';
 import {
   Account,
   Keypair,
@@ -13,8 +13,8 @@ import {
 } from '@stellar/stellar-sdk';
 import jwt from 'jsonwebtoken';
 import { createHash, randomUUID } from 'node:crypto';
-import { IdempotencyUtils } from '@/utils/idempotency.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { version } from '../../../package.json';
 
 export type ExpressLikeMiddleware = (
   req: IncomingMessage,
@@ -63,7 +63,7 @@ async function readRawBody(req: IncomingMessage, maxBodyBytes: number): Promise<
   const reqWithRaw = req as IncomingMessage & RawBodyCarrier;
   if (typeof reqWithRaw.rawBody === 'string') {
     if (getBodyByteLength(reqWithRaw.rawBody) > maxBodyBytes) {
-      throw new ValidationError(`Request body too large. Max ${maxBodyBytes} bytes`);
+      throw new PayloadTooLargeError(`Request body too large. Max ${maxBodyBytes} bytes`);
     }
     return reqWithRaw.rawBody;
   }
@@ -73,7 +73,7 @@ async function readRawBody(req: IncomingMessage, maxBodyBytes: number): Promise<
     const serialized =
       typeof bodyFromFramework === 'string' ? bodyFromFramework : JSON.stringify(bodyFromFramework);
     if (getBodyByteLength(serialized) > maxBodyBytes) {
-      throw new ValidationError(`Request body too large. Max ${maxBodyBytes} bytes`);
+      throw new PayloadTooLargeError(`Request body too large. Max ${maxBodyBytes} bytes`);
     }
     return serialized;
   }
@@ -84,7 +84,7 @@ async function readRawBody(req: IncomingMessage, maxBodyBytes: number): Promise<
     const chunkBuffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
     totalBytes += chunkBuffer.byteLength;
     if (totalBytes > maxBodyBytes) {
-      throw new ValidationError(`Request body too large. Max ${maxBodyBytes} bytes`);
+      throw new PayloadTooLargeError(`Request body too large. Max ${maxBodyBytes} bytes`);
     }
     chunks.push(chunkBuffer);
   }
@@ -94,12 +94,51 @@ async function readRawBody(req: IncomingMessage, maxBodyBytes: number): Promise<
 function jsonParseObject(rawBody: string): Record<string, unknown> {
   if (!rawBody) return {};
 
-  const parsed: unknown = JSON.parse(rawBody);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    throw new ValidationError('Request body must be valid JSON');
+  }
+
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new ValidationError('Request JSON body must be an object');
   }
 
   return parsed as Record<string, unknown>;
+}
+
+async function parsePostJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  maxBodyBytes: number,
+): Promise<{ rawBody: string; body: Record<string, unknown> } | null> {
+  let rawBody: string;
+  try {
+    rawBody = await readRawBody(req, maxBodyBytes);
+  } catch (error) {
+    if (error instanceof PayloadTooLargeError) {
+      sendJson(res, 413, {
+        error: 'payload_too_large',
+        message: error.message,
+      });
+      return null;
+    }
+    throw error;
+  }
+
+  try {
+    return { rawBody, body: jsonParseObject(rawBody) };
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      sendJson(res, 400, {
+        error: 'invalid_request',
+        message: error.message,
+      });
+      return null;
+    }
+    throw error;
+  }
 }
 
 function sha256(input: string): string {
@@ -127,11 +166,14 @@ function endpointPath(req: IncomingMessage): string {
   return parseUrl(req).pathname;
 }
 
-function extractClientIdentifier(req: IncomingMessage): string {
-  const forwardedFor = req.headers['x-forwarded-for'];
-  const leftMost = typeof forwardedFor === 'string' ? forwardedFor.split(',')[0].trim() : null;
+function extractClientIdentifier(req: IncomingMessage, trustForwardedFor: boolean): string {
   const socketIp = req.socket?.remoteAddress;
-  return leftMost || socketIp || 'unknown';
+  if (trustForwardedFor) {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const leftMost = typeof forwardedFor === 'string' ? forwardedFor.split(',')[0].trim() : null;
+    return leftMost || socketIp || 'unknown';
+  }
+  return socketIp || 'unknown';
 }
 
 function hasValidSignature(transaction: Transaction, publicKey: string): boolean {
@@ -237,7 +279,7 @@ export class AnchorExpressRouter {
     const method = (req.method ?? 'GET').toUpperCase();
 
     if (method === 'GET' && path === '/health') {
-      sendJson(res, 200, { status: 'ok' });
+      sendJson(res, 200, { status: 'ok', version });
       return;
     }
 
@@ -246,6 +288,7 @@ export class AnchorExpressRouter {
       const responseBody: Record<string, unknown> = {
         name: fullConfig.operational?.name ?? 'Anchor-Kit Anchor',
         network: fullConfig.network.network,
+        network_passphrase: this.networkPassphrase,
         assets: fullConfig.assets.assets,
         version,
       };
@@ -331,8 +374,11 @@ export class AnchorExpressRouter {
         return;
       }
 
-      const rawBody = await readRawBody(req, this.maxBodyBytes);
-      const body = jsonParseObject(rawBody);
+      const parsedBody = await parsePostJsonBody(req, res, this.maxBodyBytes);
+      if (!parsedBody) {
+        return;
+      }
+      const { body } = parsedBody;
       const account = typeof body.account === 'string' ? body.account : '';
       const signedChallenge = typeof body.challenge === 'string' ? body.challenge : '';
 
@@ -415,6 +461,9 @@ export class AnchorExpressRouter {
       await this.database.markAuthChallengeConsumed(stored.id);
 
       const tokenLifetime = this.config.get('security').authTokenLifetimeSeconds ?? 3600;
+      const expiresAt = new Date(
+        (Math.floor(Date.now() / 1000) + tokenLifetime) * 1000,
+      ).toISOString();
 
       const token = jwt.sign(
         {
@@ -430,6 +479,7 @@ export class AnchorExpressRouter {
       sendJson(res, 200, {
         token,
         expires_in: tokenLifetime,
+        expires_at: expiresAt,
         token_type: 'Bearer',
       });
       return;
@@ -446,8 +496,11 @@ export class AnchorExpressRouter {
         return;
       }
 
-      const rawBody = await readRawBody(req, this.maxBodyBytes);
-      const body = jsonParseObject(rawBody);
+      const parsedBody = await parsePostJsonBody(req, res, this.maxBodyBytes);
+      if (!parsedBody) {
+        return;
+      }
+      const { body } = parsedBody;
       const assetCode = typeof body.asset_code === 'string' ? body.asset_code : '';
       const amountRaw = body.amount;
       const amount =
@@ -501,25 +554,72 @@ export class AnchorExpressRouter {
       const scope = `deposit:${auth.account}`;
       const requestHash = sha256(JSON.stringify({ assetCode, amount }));
 
-      if (idempotencyKey !== null) {
-        const existing = await this.database.getIdempotencyRecord(scope, idempotencyKey);
-        if (existing) {
-          if (existing.requestHash !== requestHash) {
-            sendJson(res, 409, {
-              error: 'idempotency_conflict',
-              message: 'Idempotency key was already used with a different request body',
-            });
-            return;
-          }
+      if (typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
+        const idempotencyId = randomUUID();
+        // Try to insert idempotency record atomically with placeholder values
+        const idempotencyRecord = await this.database.insertOrGetIdempotencyRecord({
+          id: idempotencyId,
+          scope,
+          idempotencyKey,
+          requestHash,
+          statusCode: 201, // Placeholder
+          responseBody: '{}', // Placeholder
+        });
 
-          sendJson(res, existing.statusCode, {
-            ...(JSON.parse(existing.responseBody) as Record<string, unknown>),
-            idempotency_replay: true,
+        // Check if this is the record we just inserted (ID matches)
+        if (idempotencyRecord.id === idempotencyId) {
+          // This is our new record, proceed with transaction creation
+          const transactionId = randomUUID();
+          const created = await this.database.insertInteractiveTransaction({
+            id: transactionId,
+            account: auth.account,
+            kind: 'deposit',
+            assetCode,
+            amount,
+            status: 'pending_user_transfer_start',
+          });
+
+          const responseBody = {
+            id: created.id,
+            kind: created.kind,
+            status: created.status,
+            amount: created.amount,
+            asset_code: created.assetCode,
+            asset_issuer: selectedAsset.issuer,
+            account: created.account,
+            interactive_url: `${this.config.get('server').interactiveDomain ?? 'http://localhost:3000'}/deposit/${created.id}`,
+            created_at: created.createdAt,
+          };
+
+          await this.database.updateIdempotencyRecord({
+            scope,
+            idempotencyKey,
+            statusCode: 201,
+            responseBody: JSON.stringify(responseBody),
+          });
+
+          sendJson(res, 201, responseBody);
+          return;
+        }
+
+        // This is an existing record - check if request hash matches
+        if (idempotencyRecord.requestHash !== requestHash) {
+          sendJson(res, 409, {
+            error: 'idempotency_conflict',
+            message: 'Idempotency key was already used with a different request body',
           });
           return;
         }
+
+        // This is an existing record with the same request hash - replay the response
+        sendJson(res, idempotencyRecord.statusCode, {
+          ...(JSON.parse(idempotencyRecord.responseBody) as Record<string, unknown>),
+          idempotency_replay: true,
+        });
+        return;
       }
 
+      // No idempotency key provided, proceed with normal flow
       const transactionId = randomUUID();
       const created = await this.database.insertInteractiveTransaction({
         id: transactionId,
@@ -539,21 +639,11 @@ export class AnchorExpressRouter {
           amount: created.amount,
           asset_code: created.assetCode,
           asset_issuer: selectedAsset.issuer,
+          account: created.account,
           interactive_url: `${this.config.get('server').interactiveDomain ?? 'http://localhost:3000'}/deposit/${created.id}`,
           created_at: created.createdAt,
         },
       };
-
-      if (typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
-        await this.database.insertIdempotencyRecord({
-          id: randomUUID(),
-          scope,
-          idempotencyKey,
-          requestHash,
-          statusCode: response.status,
-          responseBody: JSON.stringify(response.body),
-        });
-      }
 
       sendJson(res, response.status, response.body);
       return;
@@ -612,8 +702,11 @@ export class AnchorExpressRouter {
         return;
       }
 
-      const rawBody = await readRawBody(req, this.maxBodyBytes);
-      const payload = jsonParseObject(rawBody);
+      const parsedBody = await parsePostJsonBody(req, res, this.maxBodyBytes);
+      if (!parsedBody) {
+        return;
+      }
+      const { rawBody, body: payload } = parsedBody;
       const eventIdField = payload.id;
       const eventId =
         typeof eventIdField === 'string' && eventIdField.length > 0 ? eventIdField : randomUUID();
@@ -648,6 +741,7 @@ export class AnchorExpressRouter {
         sendJson(res, 400, {
           error: 'webhook_error',
           message: 'Webhook processing failed',
+          event_id: eventId,
         });
       }
       return;
@@ -661,7 +755,8 @@ export class AnchorExpressRouter {
     res: ServerResponse,
     endpoint: 'auth_challenge' | 'auth_token' | 'webhook' | 'deposit',
   ): boolean {
-    const clientId = extractClientIdentifier(req);
+    const trustForwardedFor = this.config.get('framework')?.rateLimit?.trustForwardedFor ?? false;
+    const clientId = extractClientIdentifier(req, trustForwardedFor);
     const key = `${endpoint}:${clientId}`;
     const result = this.rateLimiter.hit(key, this.rateRules[endpoint]);
 
@@ -670,6 +765,7 @@ export class AnchorExpressRouter {
       sendJson(res, 429, {
         error: 'rate_limited',
         message: 'Too many requests',
+        retry_after_seconds: result.retryAfterSeconds,
       });
       return false;
     }
